@@ -13,10 +13,13 @@ import webbrowser
 import random
 
 # ───────── 설정 ─────────
-PYTHON_PATH = r"E:\phishing_trainer\venv\Scripts\python.exe"
+# Python interpreter used for launching the server. Using the current
+# interpreter path improves portability when packaged.
+PYTHON_PATH = sys.executable
 SERVER_HOST = "192.168.100.81"
 SERVER_PORT = 8000
 SERVER_BASE = f"http://{SERVER_HOST}:{SERVER_PORT}"
+BASE_DIR = os.path.dirname(resource_path("main.py"))
 
 # ───────── 경로 헬퍼 ─────────
 def resource_path(relative: str) -> str:
@@ -35,7 +38,7 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 app = ctk.CTk()
 app.title("Phishing Trainer 제어판")
-app.geometry("480x800")
+app.geometry("480x880")
 
 # ───────── 템플릿 로딩 ─────────
 template_dir = resource_path("templates")
@@ -237,28 +240,39 @@ def refresh_templates():
     except Exception as e:
         log(f"❌ 템플릿 목록 갱신 실패: {e}")
 
+def _read_server_output(proc):
+    """Background reader for server stdout to relay messages to the log box."""
+    if not proc.stdout:
+        return
+    for line in proc.stdout:
+        if line:
+            log(line.rstrip())
+
 def start_server():
     global server_process, running
-    if not running:
-        try:
-            server_process = subprocess.Popen([
-                PYTHON_PATH, "-m", "uvicorn", "main:app",
-                "--host", "0.0.0.0", "--port", str(SERVER_PORT)
-            ])
-            running = True
-            status_label.configure(text="서버 실행 중", text_color="green")
-            log("✅ 서버 시작됨")
-            threading.Thread(target=update_status_loop,
-                             daemon=True).start()
-        except Exception as e:
-            log(f"❌ 서버 실행 오류: {e}")
-    else:
+    if running:
         log("⚠️ 서버가 이미 실행 중입니다.")
+        return
+    try:
+        server_process = subprocess.Popen([
+            PYTHON_PATH, "-m", "uvicorn", "main:app",
+            "--host", "0.0.0.0", "--port", str(SERVER_PORT)
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+           cwd=BASE_DIR, text=True)
+        running = True
+        status_label.configure(text="서버 실행 중", text_color="green")
+        log("✅ 서버 시작됨")
+        threading.Thread(target=_read_server_output, args=(server_process,),
+                         daemon=True).start()
+        threading.Thread(target=update_status_loop, daemon=True).start()
+    except Exception as e:
+        log(f"❌ 서버 실행 오류: {e}")
 
 def stop_server():
     global server_process, running
     if running and server_process:
         server_process.terminate()
+        server_process.wait(timeout=5)
         server_process = None
         running = False
         status_label.configure(text="서버 중지됨", text_color="red")
