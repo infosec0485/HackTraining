@@ -67,6 +67,7 @@ def set_mode(mode: int):
     else:
         step2_btn.configure(state="normal")
         step3_btn.configure(state="disabled")
+    mode_label.configure(text=f"현재 모드: {mode}단계")
     log(f"🔧 훈련 모드 설정: {mode}단계")
 
 # (row 1) 2단계 / 3단계 버튼
@@ -77,6 +78,8 @@ step3_btn = ctk.CTkButton(server_frame, text="3단계(열람/개인정보/감염
 step2_btn.grid(row=1, column=0, padx=5, pady=3)
 step3_btn.grid(row=1, column=1, padx=5, pady=3)
 step2_btn.configure(state="disabled")          # 기본 2단계
+mode_label = ctk.CTkLabel(server_frame, text="현재 모드: 2단계")
+mode_label.grid(row=2, column=0, columnspan=2, pady=(0,5))
 
 ctk.CTkLabel(app, text="──────────────────────────────────────",
              text_color="gray").pack(pady=5)
@@ -293,7 +296,8 @@ def send_emails():
         payload = {
             "csv_path":      csv_path,
             "template_name": tpl,
-            "training_mode": training_mode   # 2 or 3
+            "training_mode": training_mode,  # 2 or 3
+            "server_base":   SERVER_BASE
         }
         res = requests.post(f"{SERVER_BASE}/send-emails", json=payload)
         log(f"📤 메일 발송 완료: {res.json()}")
