@@ -1,9 +1,9 @@
 import customtkinter as ctk
-import subprocess
+import uvicorn
 import threading
 import requests
 import time
-import os, csv
+import os, csv, sys
 from jinja2 import Environment, FileSystemLoader
 from tkinter import filedialog
 from datetime import datetime
@@ -13,13 +13,22 @@ import webbrowser
 import random
 
 # ───────── 설정 ─────────
-PYTHON_PATH = r"E:\phishing_trainer\venv\Scripts\python.exe"
 SERVER_HOST = "192.168.100.81"
 SERVER_PORT = 8000
 SERVER_BASE = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
+# ───────── 경로 헬퍼 ─────────
+def resource_path(relative: str) -> str:
+    """Return absolute path to resource, compatible with PyInstaller"""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+# Directory containing the server code
+BASE_DIR = os.path.dirname(resource_path("main.py"))
+
 # ───────── 상태 변수 ─────────
-server_process = None
+server = None          # uvicorn.Server instance
+server_thread = None
 running = False
 csv_path = "spam.csv"
 csv_total = 0
@@ -30,12 +39,18 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 app = ctk.CTk()
 app.title("Phishing Trainer 제어판")
-app.geometry("480x800")
+app.geometry("480x880")
 
 # ───────── 템플릿 로딩 ─────────
-env = Environment(loader=FileSystemLoader("templates"))
-template_files = [f for f in os.listdir("templates") if f.endswith(".html")]
-selected_template = ctk.StringVar(value=template_files[0] if template_files else "(없음)")
+template_dir = resource_path("templates")
+env = Environment(loader=FileSystemLoader(template_dir))
+template_files = [f for f in os.listdir(template_dir) if f.endswith(".html")]
+selected_template = ctk.StringVar(
+    value=template_files[0] if template_files else "(없음)"
+)
+selected_info_template = ctk.StringVar(
+    value=template_files[0] if template_files else "(없음)"
+)
 
 # ───────── 로그창 ─────────
 log_box = ctk.CTkTextbox(app, width=440, height=200, font=("맑은 고딕", 11))
@@ -64,9 +79,12 @@ def set_mode(mode: int):
     if mode == 2:
         step2_btn.configure(state="disabled")
         step3_btn.configure(state="normal")
+        info_template_menu.configure(state="disabled")
     else:
         step2_btn.configure(state="normal")
         step3_btn.configure(state="disabled")
+        info_template_menu.configure(state="normal")
+    mode_label.configure(text=f"현재 모드: {mode}단계")
     log(f"🔧 훈련 모드 설정: {mode}단계")
 
 # (row 1) 2단계 / 3단계 버튼
@@ -77,6 +95,8 @@ step3_btn = ctk.CTkButton(server_frame, text="3단계(열람/개인정보/감염
 step2_btn.grid(row=1, column=0, padx=5, pady=3)
 step3_btn.grid(row=1, column=1, padx=5, pady=3)
 step2_btn.configure(state="disabled")          # 기본 2단계
+mode_label = ctk.CTkLabel(server_frame, text="현재 모드: 2단계")
+mode_label.grid(row=2, column=0, columnspan=2, pady=(0,5))
 
 ctk.CTkLabel(app, text="──────────────────────────────────────",
              text_color="gray").pack(pady=5)
@@ -95,6 +115,14 @@ ctk.CTkLabel(input_frame, text="📁 메일 템플릿 선택",
 template_menu = ctk.CTkOptionMenu(input_frame, values=template_files,
                                   variable=selected_template)
 template_menu.pack(pady=(0,5))
+ctk.CTkLabel(input_frame, text="📁 개인정보 입력 템플릿",
+             font=("맑은 고딕", 13)).pack(pady=(10,2))
+info_template_menu = ctk.CTkOptionMenu(input_frame, values=template_files,
+                                       variable=selected_info_template)
+info_template_menu.pack(pady=(0,5))
+info_template_menu.configure(state="disabled")
+ctk.CTkButton(input_frame, text="🔄 템플릿 목록 새로고침",
+              command=lambda: refresh_templates()).pack(pady=3)
 ctk.CTkButton(input_frame, text="템플릿 미리보기",
               command=lambda: preview_template()).pack(pady=5)
 
@@ -129,7 +157,7 @@ log_box.pack(padx=10, pady=10)
 
 # ───────── 로고 ─────────
 try:
-    logo = Image.open("logo.png").convert("RGBA").resize((160, 40))
+    logo = Image.open(resource_path("logo.png")).convert("RGBA").resize((160, 40))
     logo_img = ImageTk.PhotoImage(logo)
     logo_label = tk.Label(app, image=logo_img, bg=app.cget("bg"))
     logo_label.image = logo_img
@@ -199,29 +227,54 @@ def show_training_status_table():
                          font=("맑은 고딕", 10),
                          anchor="center", width=160).grid(row=r, column=c)
 
+def refresh_templates():
+    """Reload template filenames from disk and update the menus."""
+    global template_files
+    try:
+        template_files = [f for f in os.listdir(template_dir) if f.endswith(".html")]
+        template_menu.configure(values=template_files)
+        info_template_menu.configure(values=template_files)
+        if template_files:
+            selected_template.set(template_files[0])
+            selected_info_template.set(template_files[0])
+        log(f"🔄 템플릿 목록 갱신 완료 ({len(template_files)}개)")
+    except Exception as e:
+        log(f"❌ 템플릿 목록 갱신 실패: {e}")
+
+def _run_server():
+    """Run the FastAPI server using uvicorn in a background thread."""
+    global server
+    prev_cwd = os.getcwd()
+    os.chdir(BASE_DIR)
+    try:
+        config = uvicorn.Config("main:app", host="0.0.0.0", port=SERVER_PORT, log_level="info", reload=False)
+        server = uvicorn.Server(config)
+        server.run()
+    finally:
+        os.chdir(prev_cwd)
+
 def start_server():
-    global server_process, running
-    if not running:
-        try:
-            server_process = subprocess.Popen([
-                PYTHON_PATH, "-m", "uvicorn", "main:app",
-                "--host", "0.0.0.0", "--port", str(SERVER_PORT)
-            ])
-            running = True
-            status_label.configure(text="서버 실행 중", text_color="green")
-            log("✅ 서버 시작됨")
-            threading.Thread(target=update_status_loop,
-                             daemon=True).start()
-        except Exception as e:
-            log(f"❌ 서버 실행 오류: {e}")
-    else:
+    global server_thread, running
+    if running:
         log("⚠️ 서버가 이미 실행 중입니다.")
+        return
+    try:
+        server_thread = threading.Thread(target=_run_server, daemon=True)
+        server_thread.start()
+        running = True
+        status_label.configure(text="서버 실행 중", text_color="green")
+        log("✅ 서버 시작됨")
+        threading.Thread(target=update_status_loop, daemon=True).start()
+    except Exception as e:
+        log(f"❌ 서버 실행 오류: {e}")
 
 def stop_server():
-    global server_process, running
-    if running and server_process:
-        server_process.terminate()
-        server_process = None
+    global running, server
+    if running and server:
+        server.should_exit = True
+        if server_thread:
+            server_thread.join(timeout=5)
+        server = None
         running = False
         status_label.configure(text="서버 중지됨", text_color="red")
         log("🛑 서버 중지됨")
@@ -251,18 +304,18 @@ def update_status_loop():
     global running
     while running:
         try:
-            if server_process.poll() is not None:
+            if server_thread and not server_thread.is_alive():
                 running = False
-                status_label.configure(text="서버 중지됨",
-                                       text_color="red")
+                status_label.configure(text="서버 중지됨", text_color="red")
                 log("🛑 서버가 종료되었습니다.")
                 break
             r = requests.get(f"{SERVER_BASE}/infect-stats").json()
             count = r.get("infected_count", 0)
             total = csv_total
-            rate  = round((count / total) * 100, 1) if total else 0.0
+            rate = round((count / total) * 100, 1) if total else 0.0
             infection_label.configure(
-                text=f"🦠 감염자 수: {count}명\n전체 {total}명 | 감염률 {rate}%")
+                text=f"🦠 감염자 수: {count}명\n전체 {total}명 | 감염률 {rate}%"
+            )
         except Exception:
             infection_label.configure(text="❌ 감염자 수: 확인 실패")
         time.sleep(2)
@@ -287,13 +340,15 @@ def send_emails():
         return
     try:
         tpl = selected_template.get()
-        if not os.path.exists(os.path.join("templates", tpl)):
+        if not os.path.exists(os.path.join(template_dir, tpl)):
             log("❌ 템플릿 없음")
             return
         payload = {
             "csv_path":      csv_path,
             "template_name": tpl,
-            "training_mode": training_mode   # 2 or 3
+            "training_mode": training_mode,  # 2 or 3
+            "server_base":   SERVER_BASE,
+            "info_template_name": selected_info_template.get()
         }
         res = requests.post(f"{SERVER_BASE}/send-emails", json=payload)
         log(f"📤 메일 발송 완료: {res.json()}")
