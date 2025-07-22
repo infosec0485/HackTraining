@@ -19,12 +19,15 @@ PYTHON_PATH = sys.executable
 SERVER_HOST = "192.168.100.81"
 SERVER_PORT = 8000
 SERVER_BASE = f"http://{SERVER_HOST}:{SERVER_PORT}"
-BASE_DIR = os.path.dirname(resource_path("main.py"))
 
 # ───────── 경로 헬퍼 ─────────
 def resource_path(relative: str) -> str:
+    """Return absolute path to resource, compatible with PyInstaller"""
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative)
+
+# Directory containing the server code
+BASE_DIR = os.path.dirname(resource_path("main.py"))
 
 # ───────── 상태 변수 ─────────
 server_process = None
