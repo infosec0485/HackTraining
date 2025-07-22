@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 from uuid import UUID
 from dotenv import load_dotenv
+import sys
 
 import uvicorn
 from fastapi import FastAPI, Request, Body
@@ -30,11 +31,17 @@ load_dotenv()
 
 # FastAPI 앱 초기화
 app = FastAPI()
-app.mount("/files", StaticFiles(directory="files"), name="files")
+
+# ───────── 경로 헬퍼 ─────────
+def resource_path(relative: str) -> str:
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+app.mount("/files", StaticFiles(directory=resource_path("files")), name="files")
 
 # 템플릿 설정
-templates = Jinja2Templates(directory="templates")
-env = Environment(loader=FileSystemLoader("templates"))
+templates = Jinja2Templates(directory=resource_path("templates"))
+env = Environment(loader=FileSystemLoader(resource_path("templates")))
 
 # 현재 훈련 테이블 관리
 CURRENT_TABLE_FILE = "current_training_table.txt"
@@ -51,10 +58,85 @@ def set_current_table(table_name: str):
 def is_locked(table: str) -> bool:
     return table.endswith("_locked")
 
+async def record_click(id: UUID, request: Request):
+    table = get_current_table()
+    if not table or is_locked(table):
+        return
+    now    = datetime.now()
+    ip     = request.client.host
+    ua     = request.headers.get("user-agent", "")
+    ref    = request.headers.get("referer", "")
+    lang   = request.headers.get("accept-language", "")
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute(
+            f"""
+            UPDATE {table}
+               SET clicked_at      = %s,
+                   ip_address      = %s,
+                   user_agent      = %s,
+                   referer         = %s,
+                   accept_language = %s
+             WHERE id = %s
+               AND clicked_at IS NULL
+            """,
+            (now, ip, ua, ref, lang, str(id)),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logging.error(f"record_click error: {e}")
+
+
+async def record_infection(id: UUID, request: Request):
+    table = get_current_table()
+    if not table or is_locked(table):
+        return False
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            INSERT INTO {table}
+                (id, ip_address, user_agent, referer, accept_language, clicked_at, infected_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE
+              SET
+                infected_at      = EXCLUDED.infected_at,
+                clicked_at       = COALESCE(EXCLUDED.clicked_at, {table}.clicked_at),
+                ip_address       = EXCLUDED.ip_address,
+                user_agent       = EXCLUDED.user_agent,
+                referer          = EXCLUDED.referer,
+                accept_language  = EXCLUDED.accept_language
+            """,
+            (
+                str(id),
+                request.client.host,
+                request.headers.get("user-agent", ""),
+                request.headers.get("referer", ""),
+                request.headers.get("accept-language", ""),
+                datetime.now(),
+                datetime.now(),
+            ),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"record_infection error: {e}")
+        return False
+
 # JSON 바디 모델
+training_mode = 2  # 2단계 기본값
+
 class SendEmailRequest(BaseModel):
     csv_path: str
     template_name: str
+    training_mode: int = 2
+    server_base: str | None = None
 
 # 1) 훈련 시작
 @app.post("/start-training")
@@ -225,6 +307,8 @@ async def get_click_logs():
 # 5) 메일 발송 (JSON 바디 방식)
 @app.post("/send-emails")
 async def send_emails(payload: SendEmailRequest = Body(...)):
+    global training_mode
+    training_mode = payload.training_mode
     table = get_current_table()
     if not table or is_locked(table):
         return JSONResponse(status_code=400, content={"error": "활성화된 훈련 없음 또는 이미 종료됨"})
@@ -259,7 +343,12 @@ async def send_emails(payload: SendEmailRequest = Body(...)):
                 conn.close()
 
                 # 메일 전송
-                html = template.render(name=row.get("성명", ""), uuid=unique_id)
+                html = template.render(
+                    name=row.get("성명", ""),
+                    uuid=unique_id,
+                    training_mode=training_mode,
+                    server_base=payload.server_base,
+                )
                 msg = EmailMessage()
                 msg["Subject"] = "[중요] 의심스러운 로그인 시도가 차단됨"
                 msg["From"] = os.getenv("SMTP_FROM")
@@ -303,46 +392,7 @@ async def send_emails(payload: SendEmailRequest = Body(...)):
 # 6) 피싱 감염 기록
 @app.get("/infect")
 async def infect(id: UUID, request: Request):
-    table = get_current_table()
-    if not table or is_locked(table):
-        return HTMLResponse("<h3>⛔ 훈련이 종료되어 기록할 수 없습니다.</h3>")
-
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        
-        # 이 부분을 아래로 교체
-        cur.execute(
-            f"""
-            INSERT INTO {table}
-                (id, ip_address, user_agent, referer, accept_language, clicked_at, infected_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (id) DO UPDATE
-              SET
-                infected_at      = EXCLUDED.infected_at,
-                clicked_at       = COALESCE(EXCLUDED.clicked_at, {table}.clicked_at),
-                ip_address       = EXCLUDED.ip_address,
-                user_agent       = EXCLUDED.user_agent,
-                referer          = EXCLUDED.referer,
-                accept_language  = EXCLUDED.accept_language
-            """,
-            (
-                str(id),
-                request.client.host,
-                request.headers.get("user-agent", ""),
-                request.headers.get("referer", ""),
-                request.headers.get("accept-language", ""),
-                datetime.now(),
-                datetime.now()
-            )
-        )
-
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        logging.error(f"infect error: {e}")
-
+    await record_infection(id, request)
     return templates.TemplateResponse("감염페이지.html", {"request": request})
 
 
@@ -353,33 +403,22 @@ async def track_click(id: UUID, request: Request):
     if not table or is_locked(table):
         return HTMLResponse(status_code=204)
 
-    now    = datetime.now()
-    ip     = request.client.host
-    ua     = request.headers.get("user-agent", "")
-    ref    = request.headers.get("referer", "")
-    lang   = request.headers.get("accept-language", "")
-
-    try:
-        conn = get_connection()
-        cur  = conn.cursor()
-        cur.execute(f"""
-            UPDATE {table}
-               SET clicked_at      = %s,
-                   ip_address      = %s,
-                   user_agent      = %s,
-                   referer         = %s,
-                   accept_language = %s
-             WHERE id = %s
-               AND clicked_at IS NULL
-        """, (now, ip, ua, ref, lang, str(id)))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        logging.error(f"track_click error: {e}")
+    await record_click(id, request)
 
     # 투명 픽셀 응답
     return RedirectResponse(url="/files/1x1.png", status_code=204)
+
+# 7-1) 개인정보 입력 화면 (3단계용)
+@app.get("/view-info")
+async def view_info(id: UUID, request: Request):
+    await record_click(id, request)
+    return templates.TemplateResponse("개인정보입력페이지.html", {"request": request, "id": id})
+
+# 7-2) 개인정보 전송 후 감염 처리
+@app.post("/submit-info")
+async def submit_info(id: UUID, request: Request):
+    await record_infection(id, request)
+    return templates.TemplateResponse("감염페이지.html", {"request": request})
 
 # 8) 감염 통계 제공
 @app.get("/infect-stats")

@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>개인정보 입력</title></head>
+<body>
+<h3>개인정보를 입력해주세요 (훈련용 화면)</h3>
+<form method="post" action="/submit-info">
+<input type="hidden" name="id" value="{{ id }}" />
+이름: <input type="text" name="name"><br>
+비밀번호: <input type="password" name="pw"><br>
+<button type="submit">전송</button>
+</form>
+</body>
+</html>
