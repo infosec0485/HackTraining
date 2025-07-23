@@ -1,5 +1,5 @@
 import customtkinter as ctk
-import subprocess
+import uvicorn
 import threading
 import requests
 import time
@@ -13,21 +13,22 @@ import webbrowser
 import random
 
 # ───────── 설정 ─────────
-# Python interpreter used for launching the server. Using the current
-# interpreter path improves portability when packaged.
-PYTHON_PATH = sys.executable
 SERVER_HOST = "192.168.100.81"
 SERVER_PORT = 8000
 SERVER_BASE = f"http://{SERVER_HOST}:{SERVER_PORT}"
-BASE_DIR = os.path.dirname(resource_path("main.py"))
 
 # ───────── 경로 헬퍼 ─────────
 def resource_path(relative: str) -> str:
+    """Return absolute path to resource, compatible with PyInstaller"""
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative)
 
+# Directory containing the server code
+BASE_DIR = os.path.dirname(resource_path("main.py"))
+
 # ───────── 상태 변수 ─────────
-server_process = None
+server = None          # uvicorn.Server instance
+server_thread = None
 running = False
 csv_path = "spam.csv"
 csv_total = 0
@@ -240,40 +241,40 @@ def refresh_templates():
     except Exception as e:
         log(f"❌ 템플릿 목록 갱신 실패: {e}")
 
-def _read_server_output(proc):
-    """Background reader for server stdout to relay messages to the log box."""
-    if not proc.stdout:
-        return
-    for line in proc.stdout:
-        if line:
-            log(line.rstrip())
+def _run_server():
+    """Run the FastAPI server using uvicorn in a background thread."""
+    global server
+    prev_cwd = os.getcwd()
+    os.chdir(BASE_DIR)
+    try:
+        config = uvicorn.Config("main:app", host="0.0.0.0", port=SERVER_PORT, log_level="info", reload=False)
+        server = uvicorn.Server(config)
+        server.run()
+    finally:
+        os.chdir(prev_cwd)
 
 def start_server():
-    global server_process, running
+    global server_thread, running
     if running:
         log("⚠️ 서버가 이미 실행 중입니다.")
         return
     try:
-        server_process = subprocess.Popen([
-            PYTHON_PATH, "-m", "uvicorn", "main:app",
-            "--host", "0.0.0.0", "--port", str(SERVER_PORT)
-        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-           cwd=BASE_DIR, text=True)
+        server_thread = threading.Thread(target=_run_server, daemon=True)
+        server_thread.start()
         running = True
         status_label.configure(text="서버 실행 중", text_color="green")
         log("✅ 서버 시작됨")
-        threading.Thread(target=_read_server_output, args=(server_process,),
-                         daemon=True).start()
         threading.Thread(target=update_status_loop, daemon=True).start()
     except Exception as e:
         log(f"❌ 서버 실행 오류: {e}")
 
 def stop_server():
-    global server_process, running
-    if running and server_process:
-        server_process.terminate()
-        server_process.wait(timeout=5)
-        server_process = None
+    global running, server
+    if running and server:
+        server.should_exit = True
+        if server_thread:
+            server_thread.join(timeout=5)
+        server = None
         running = False
         status_label.configure(text="서버 중지됨", text_color="red")
         log("🛑 서버 중지됨")
@@ -303,18 +304,18 @@ def update_status_loop():
     global running
     while running:
         try:
-            if server_process.poll() is not None:
+            if server_thread and not server_thread.is_alive():
                 running = False
-                status_label.configure(text="서버 중지됨",
-                                       text_color="red")
+                status_label.configure(text="서버 중지됨", text_color="red")
                 log("🛑 서버가 종료되었습니다.")
                 break
             r = requests.get(f"{SERVER_BASE}/infect-stats").json()
             count = r.get("infected_count", 0)
             total = csv_total
-            rate  = round((count / total) * 100, 1) if total else 0.0
+            rate = round((count / total) * 100, 1) if total else 0.0
             infection_label.configure(
-                text=f"🦠 감염자 수: {count}명\n전체 {total}명 | 감염률 {rate}%")
+                text=f"🦠 감염자 수: {count}명\n전체 {total}명 | 감염률 {rate}%"
+            )
         except Exception:
             infection_label.configure(text="❌ 감염자 수: 확인 실패")
         time.sleep(2)
